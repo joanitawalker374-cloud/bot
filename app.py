@@ -9,14 +9,17 @@ Sens 1 (Discord -> GeeLark) : tu postes le code dans le salon, GeeLark le recupe
 
 Sens 2 (GeeLark -> Discord) : quand IG demande un code, GeeLark previent le salon.
   GeeLark appelle :  GET /notify?account=<User>
-    -> le bot poste "Code Instagram demande pour <User>, poste le code ici."
+    -> le bot poste "Instagram demande un code ... poste le code ici".
+
+Les messages (alerte + code) s'effacent tout seuls apres AUTODELETE secondes.
 
 Variables d'environnement :
-  DISCORD_TOKEN       = token du bot                              (obligatoire)
-  CHANNEL_ID          = salon a ECOUTER (0 = tous les salons)     (defaut 0)
-  NOTIFY_CHANNEL_ID   = salon ou POSTER les alertes /notify       (obligatoire pour /notify)
+  DISCORD_TOKEN       = token du bot                               (obligatoire)
+  CHANNEL_ID          = salon a ECOUTER (0 = tous les salons)      (defaut 0)
+  NOTIFY_CHANNEL_ID   = salon ou POSTER les alertes (0 = auto)     (defaut 0)
+  AUTODELETE          = efface les messages apres X s (0 = jamais) (defaut 60)
   API_SECRET          = mot de passe optionnel pour /code et /set
-  CODE_TTL            = duree de validite d'un code en s          (defaut 300)
+  CODE_TTL            = duree de validite d'un code en s           (defaut 300)
   PORT                = port HTTP (fourni par l'hebergeur)
 """
 
@@ -33,14 +36,16 @@ from flask import Flask, request, jsonify
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0") or "0")
 NOTIFY_CHANNEL_ID = int(os.environ.get("NOTIFY_CHANNEL_ID", "0") or "0")
+AUTODELETE = int(os.environ.get("AUTODELETE", "60"))   # efface messages apres X s (0 = jamais)
 API_SECRET = os.environ.get("API_SECRET", "").strip()
 CODE_TTL = int(os.environ.get("CODE_TTL", "300"))
 PORT = int(os.environ.get("PORT", "8080"))
 
 CODE_RE = re.compile(r"\b(\d{4,8})\b")
 
-store = {}            # { "<account>": (code, timestamp) }  + cle "_last"
+store = {}                 # { "<account>": (code, timestamp) }  + cle "_last"
 store_lock = threading.Lock()
+last_channel = {"id": 0}   # dernier salon ou un user a ecrit (auto-cible des alertes)
 
 
 def _save(account, code):
@@ -80,6 +85,8 @@ async def on_message(message):
     if CHANNEL_ID and message.channel.id != CHANNEL_ID:
         return
 
+    last_channel["id"] = message.channel.id  # memorise le salon pour les alertes
+
     content = message.content.strip()
     parts = content.split()
 
@@ -102,6 +109,11 @@ async def on_message(message):
             await message.add_reaction("✅")
         except Exception:
             pass
+        if AUTODELETE:
+            try:
+                await message.delete(delay=AUTODELETE)
+            except Exception:
+                pass
 
 
 def run_discord():
@@ -109,6 +121,27 @@ def run_discord():
         print("[discord] DISCORD_TOKEN manquant -> bot non demarre")
         return
     client.run(DISCORD_TOKEN)
+
+
+def _pick_notify_channel():
+    """NOTIFY_CHANNEL_ID, sinon dernier salon utilise, sinon 1er salon ou le bot peut ecrire."""
+    if NOTIFY_CHANNEL_ID:
+        ch = client.get_channel(NOTIFY_CHANNEL_ID)
+        if ch is not None:
+            return ch
+    if last_channel["id"]:
+        ch = client.get_channel(last_channel["id"])
+        if ch is not None:
+            return ch
+    for g in client.guilds:
+        me = g.me
+        for ch in g.text_channels:
+            try:
+                if ch.permissions_for(me).send_messages:
+                    return ch
+            except Exception:
+                continue
+    return None
 
 
 # ------------------------------------------------------------------ HTTP API
@@ -152,16 +185,16 @@ def notify():
         msg += f" pour `{account}`"
     msg += " — poste le code ici (juste les chiffres)."
 
-    if not NOTIFY_CHANNEL_ID:
-        return jsonify({"ok": False, "error": "NOTIFY_CHANNEL_ID non configure"}), 400
     if client.loop is None or not client.is_ready():
         return jsonify({"ok": False, "error": "bot pas pret"}), 503
 
-    channel = client.get_channel(NOTIFY_CHANNEL_ID)
+    channel = _pick_notify_channel()
     if channel is None:
-        return jsonify({"ok": False, "error": "salon introuvable / bot absent du salon"}), 404
+        return jsonify({"ok": False, "error": "aucun salon ou poster (droit d'envoyer des messages manquant, ou poste d'abord un message dans le salon)"}), 404
+
     try:
-        fut = asyncio.run_coroutine_threadsafe(channel.send(msg), client.loop)
+        coro = channel.send(msg, delete_after=(AUTODELETE or None))
+        fut = asyncio.run_coroutine_threadsafe(coro, client.loop)
         fut.result(timeout=10)
         return jsonify({"ok": True})
     except Exception as e:
