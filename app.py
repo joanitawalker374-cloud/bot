@@ -1,26 +1,29 @@
 """
-Relais Discord <-> code (pour GeeLark autologin Instagram).
+Relais Discord <-> code (pour GeeLark autologin Instagram) - salon partage multi-utilisateurs.
 
-Sens 1 (Discord -> GeeLark) : tu postes le code dans le salon, GeeLark le recupere.
-    * "joanitawalker374 482910"  -> code range pour ce compte
-    * "482910"                   -> code "dernier recu" (un compte a la fois)
-  GeeLark appelle :  GET /code?account=<User>
-    -> {"code":"482910"} si dispo (efface apres, usage unique) ; sinon {}
-
-Sens 2 (GeeLark -> Discord) : quand IG demande un code, GeeLark previent le salon.
+Sens 1 (GeeLark -> Discord) : quand IG demande un code, GeeLark previent le salon.
   GeeLark appelle :  GET /notify?account=<User>
-    -> le bot poste "Instagram demande un code ... poste le code ici".
+    -> le bot poste "Code demande pour <email> ... reponds avec <email> <code>".
+       La personne reconnait SON email et repond.
 
-Les messages (alerte + code) s'effacent tout seuls apres AUTODELETE secondes.
+Sens 2 (Discord -> GeeLark) : la personne poste "<email> <code>" dans le salon.
+  GeeLark appelle :  GET /code?account=<User>
+    -> {"code":"482910"} si dispo pour CE compte (efface apres) ; sinon {}
+
+Les messages (alerte + code) s'effacent apres AUTODELETE secondes.
+
+IMPORTANT (salon partage) : laisser ALLOW_LAST=0 pour que chaque code soit
+servi UNIQUEMENT au compte indique. Sinon les codes de 100 personnes se melangent.
 
 Variables d'environnement :
-  DISCORD_TOKEN       = token du bot                               (obligatoire)
-  CHANNEL_ID          = salon a ECOUTER (0 = tous les salons)      (defaut 0)
-  NOTIFY_CHANNEL_ID   = salon ou POSTER les alertes (0 = auto)     (defaut 0)
-  AUTODELETE          = efface les messages apres X s (0 = jamais) (defaut 60)
-  API_SECRET          = mot de passe optionnel pour /code et /set
-  CODE_TTL            = duree de validite d'un code en s           (defaut 300)
-  PORT                = port HTTP (fourni par l'hebergeur)
+  DISCORD_TOKEN     = token du bot                              (obligatoire)
+  CHANNEL_ID        = salon a ECOUTER (0 = tous)                (defaut 0)
+  NOTIFY_CHANNEL_ID = salon ou POSTER les alertes (0 = auto)    (defaut 0)
+  ALLOW_LAST        = 1 autorise "juste le code", 0 force "email code"  (defaut 1)
+  AUTODELETE        = efface les messages apres X s (0 = jamais)        (defaut 60)
+  API_SECRET        = mot de passe optionnel pour /code et /set
+  CODE_TTL          = duree de validite d'un code en s                  (defaut 300)
+  PORT              = port HTTP (fourni par l'hebergeur)
 """
 
 import os
@@ -36,7 +39,8 @@ from flask import Flask, request, jsonify
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0") or "0")
 NOTIFY_CHANNEL_ID = int(os.environ.get("NOTIFY_CHANNEL_ID", "0") or "0")
-AUTODELETE = int(os.environ.get("AUTODELETE", "60"))   # efface messages apres X s (0 = jamais)
+ALLOW_LAST = os.environ.get("ALLOW_LAST", "1").strip() not in ("0", "false", "False", "")
+AUTODELETE = int(os.environ.get("AUTODELETE", "60"))
 API_SECRET = os.environ.get("API_SECRET", "").strip()
 CODE_TTL = int(os.environ.get("CODE_TTL", "300"))
 PORT = int(os.environ.get("PORT", "8080"))
@@ -62,7 +66,7 @@ def _take(account):
         key = account.lower() if account else None
         if key and key in store:
             return store.pop(key)[0]
-        if "_last" in store:
+        if ALLOW_LAST and "_last" in store:
             return store.pop("_last")[0]
     return None
 
@@ -75,7 +79,7 @@ client = discord.Client(intents=intents)
 
 @client.event
 async def on_ready():
-    print(f"[discord] connecte: {client.user} | ecoute={CHANNEL_ID} | notify={NOTIFY_CHANNEL_ID}")
+    print(f"[discord] connecte: {client.user} | ecoute={CHANNEL_ID} | notify={NOTIFY_CHANNEL_ID} | allow_last={ALLOW_LAST}")
 
 
 @client.event
@@ -85,7 +89,7 @@ async def on_message(message):
     if CHANNEL_ID and message.channel.id != CHANNEL_ID:
         return
 
-    last_channel["id"] = message.channel.id  # memorise le salon pour les alertes
+    last_channel["id"] = message.channel.id
 
     content = message.content.strip()
     parts = content.split()
@@ -106,9 +110,19 @@ async def on_message(message):
         with store_lock:
             store["_last"] = (code, time.time())
         try:
-            await message.add_reaction("✅")
+            await message.add_reaction("✅" if account else "⚠️")
         except Exception:
             pass
+        # si pas d'email devant le code en salon partage, prevenir la personne
+        if not account and not ALLOW_LAST:
+            try:
+                warn = await message.channel.send(
+                    f"{message.author.mention} mets ton **email** devant le code : `email {code}`",
+                )
+                if AUTODELETE:
+                    await warn.delete(delay=AUTODELETE)
+            except Exception:
+                pass
         if AUTODELETE:
             try:
                 await message.delete(delay=AUTODELETE)
@@ -180,10 +194,14 @@ def set_code():
 def notify():
     """GeeLark previent qu'un code est demande -> poste un message dans le salon."""
     account = request.args.get("account", "").strip()
-    msg = "🔔 **Instagram demande un code**"
+
     if account:
-        msg += f" pour `{account}`"
-    msg += " — poste le code ici (juste les chiffres)."
+        msg = (
+            f"🔔 **Code Instagram demandé pour** `{account}`\n"
+            f"👉 Si c'est ton compte, réponds ici avec : `{account} TONCODE`"
+        )
+    else:
+        msg = "🔔 **Un code Instagram est demandé** — réponds avec `email code`."
 
     if client.loop is None or not client.is_ready():
         return jsonify({"ok": False, "error": "bot pas pret"}), 503
