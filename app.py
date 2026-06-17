@@ -39,12 +39,14 @@ import os
 import io
 import re
 import csv
+import base64
 import json
 import time
 import email
 import imaplib
 import asyncio
 import threading
+import uuid
 from datetime import datetime, timedelta
 from email.header import decode_header
 
@@ -178,13 +180,13 @@ def _body_text(msg):
 
 
 def gmail_latest_code(user, app_password, since_min):
-    M = imaplib.IMAP4_SSL("imap.gmail.com")
+    M = imaplib.IMAP4_SSL("imap.gmail.com", timeout=25)
     try:
         M.login(user, app_password)
         M.select("INBOX")
         since = (datetime.utcnow() - timedelta(minutes=since_min)).strftime("%d-%b-%Y")
         typ, data = M.search(None, f'(SINCE "{since}")')
-        ids = data[0].split() if data and data[0] else []
+        ids = (data[0].split() if data and data[0] else [])[-30:]
         for num in reversed(ids):
             typ, msgdata = M.fetch(num, "(RFC822)")
             if not msgdata or not msgdata[0]:
@@ -445,6 +447,144 @@ def notify():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+# ------------------------------------------------------------------ Vision (IA)
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+VISION_MODEL = os.environ.get("VISION_MODEL", "claude-3-5-sonnet-20241022").strip()
+OPENAI_VISION_MODEL = os.environ.get("OPENAI_VISION_MODEL", "gpt-4o").strip()
+
+VISION_PROMPT = (
+    "You are looking at a phone screenshot. Find this target element: \"{target}\".\n"
+    "Reply with ONLY a compact JSON object, no prose, no code fences:\n"
+    '{{"found": true/false, "x": <int 0-1000>, "y": <int 0-1000>}}\n'
+    "x and y are the CENTER of the target, expressed as a fraction of the image "
+    "width and height multiplied by 1000 (so x=500 means horizontal center, "
+    "y=0 means top edge). If the target is not visible, return "
+    '{{"found": false, "x": 0, "y": 0}}.'
+)
+
+
+def _parse_xy_json(text):
+    text = (text or "").strip()
+    if "```" in text:
+        text = text.split("```")[1] if text.split("```")[1:] else text
+        text = text.replace("json", "", 1).strip()
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
+def _vision_anthropic(img_b64, media_type, target):
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": VISION_MODEL,
+        "max_tokens": 100,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64",
+                                             "media_type": media_type, "data": img_b64}},
+                {"type": "text", "text": VISION_PROMPT.format(target=target)},
+            ],
+        }],
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    r.raise_for_status()
+    return r.json()["content"][0]["text"]
+
+
+def _vision_openai(img_b64, media_type, target):
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}",
+               "Content-Type": "application/json"}
+    data_uri = f"data:{media_type};base64,{img_b64}"
+    payload = {
+        "model": OPENAI_VISION_MODEL,
+        "max_tokens": 100,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": VISION_PROMPT.format(target=target)},
+                {"type": "image_url", "image_url": {"url": data_uri}},
+            ],
+        }],
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
+@app.post("/find")
+def find():
+    """Trouve un element a l'ecran et renvoie les coordonnees pixel a taper.
+
+    2 facons d'envoyer l'image :
+      1. multipart (recommande, via curl) :
+         curl -F image=@/sdcard/s.png -F target="LINK sticker" -F wh=1080x2400 .../find
+      2. JSON : {image_b64, target, wh:"1080x2400" (ou w,h), media_type?}
+    Reponse : {"found":true,"x":123,"y":456}
+    """
+    if API_SECRET and request.args.get("secret", "") != API_SECRET:
+        return jsonify({"found": False, "error": "forbidden"}), 403
+    img_b64 = ""
+    media_type = "image/png"
+    target = ""
+    wh = ""
+    w = h = 0
+    # ---- multipart (fichier envoye par curl -F) ----
+    if request.files.get("image"):
+        f = request.files["image"]
+        img_b64 = base64.b64encode(f.read()).decode("ascii")
+        media_type = f.mimetype or "image/png"
+        target = (request.form.get("target") or "").strip()
+        wh = (request.form.get("wh") or "").lower().replace(" ", "")
+        w = int(request.form.get("w", 0) or 0)
+        h = int(request.form.get("h", 0) or 0)
+    else:
+        # ---- JSON {image_b64,...} ----
+        data = request.get_json(force=True, silent=True) or {}
+        img_b64 = (data.get("image_b64") or "").strip()
+        target = (data.get("target") or "").strip()
+        media_type = (data.get("media_type") or "image/png").strip()
+        wh = (data.get("wh") or "").lower().replace(" ", "")
+        w = int(data.get("w", 0) or 0)
+        h = int(data.get("h", 0) or 0)
+    if "x" in wh:
+        try:
+            w, h = int(wh.split("x")[0]), int(wh.split("x")[1])
+        except Exception:
+            pass
+    if not img_b64 or not target:
+        return jsonify({"found": False, "error": "image et target requis"}), 400
+    try:
+        if ANTHROPIC_API_KEY:
+            raw = _vision_anthropic(img_b64, media_type, target)
+        elif OPENAI_API_KEY:
+            raw = _vision_openai(img_b64, media_type, target)
+        else:
+            return jsonify({"found": False, "error": "aucune cle vision (ANTHROPIC_API_KEY / OPENAI_API_KEY)"}), 500
+    except Exception as e:
+        return jsonify({"found": False, "error": f"vision: {e}"}), 502
+    parsed = _parse_xy_json(raw)
+    if not parsed:
+        return jsonify({"found": False, "error": "reponse modele illisible", "raw": raw[:200]}), 502
+    found = bool(parsed.get("found"))
+    nx = float(parsed.get("x", 0) or 0)
+    ny = float(parsed.get("y", 0) or 0)
+    px = int(round(nx / 1000.0 * w)) if w else int(round(nx))
+    py = int(round(ny / 1000.0 * h)) if h else int(round(ny))
+    return jsonify({"found": found, "x": px, "y": py, "nx": int(nx), "ny": int(ny)})
+
+
 if __name__ == "__main__":
     threading.Thread(target=run_discord, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT)
+    app.run(host="0.0.0.0", port=PORT, threaded=True)
